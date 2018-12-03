@@ -6,6 +6,8 @@
  * See LICENSE for licensing information
  *
  */
+#include <config.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <pwd.h>
@@ -17,6 +19,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xkb.h>
 #include <err.h>
+#include <errno.h>
 #include <assert.h>
 #ifdef __OpenBSD__
 #include <bsd_auth.h>
@@ -36,12 +39,19 @@
 #include <strings.h> /* explicit_bzero(3) */
 #endif
 #include <xcb/xcb_aux.h>
+#include <xcb/randr.h>
+#if defined(__linux__)
+#include <fcntl.h>
+#include <linux/vt.h>
+#include <sys/ioctl.h>
+#endif
 
 #include "i3lock.h"
 #include "xcb.h"
 #include "cursors.h"
 #include "unlock_indicator.h"
-#include "xinerama.h"
+#include "randr.h"
+#include "dpi.h"
 
 #define TSTAMP_N_SECS(n) (n * 1.0)
 #define TSTAMP_N_MINS(n) (60 * TSTAMP_N_SECS(n))
@@ -85,6 +95,7 @@ static struct xkb_compose_table *xkb_compose_table;
 static struct xkb_compose_state *xkb_compose_state;
 static uint8_t xkb_base_event;
 static uint8_t xkb_base_error;
+static int randr_base = -1;
 
 cairo_surface_t *img = NULL;
 bool tile = false;
@@ -176,7 +187,7 @@ static void clear_password_memory(void) {
     /* A volatile pointer to the password buffer to prevent the compiler from
      * optimizing this out. */
     volatile char *vpassword = password;
-    for (int c = 0; c < sizeof(password); c++)
+    for (size_t c = 0; c < sizeof(password); c++)
         /* We store a non-random pattern which consists of the (irrelevant)
          * index plus (!) the value of the beep variable. This prevents the
          * compiler from optimizing the calls away, since the value of 'beep'
@@ -439,6 +450,12 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             return;
         default:
             skip_repeated_empty_password = false;
+            // A new password is being entered, but a previous one is pending.
+            // Discard the old one and clear the retry_verification flag.
+            if (retry_verification) {
+                retry_verification = false;
+                clear_input();
+            }
     }
 
     switch (ksym) {
@@ -468,8 +485,12 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             if (ksym == XKB_KEY_h && !ctrl)
                 break;
 
-            if (input_position == 0)
+            if (input_position == 0) {
+                START_TIMER(clear_indicator_timeout, 1.0, clear_indicator_cb);
+                unlock_state = STATE_NOTHING_TO_DELETE;
+                redraw_screen();
                 return;
+            }
 
             /* decrement input_position to point to the previous glyph */
             u8_dec(password, &input_position);
@@ -484,7 +505,7 @@ static void handle_key_press(xcb_key_press_event_t *event) {
             return;
     }
 
-    if ((input_position + 8) >= sizeof(password))
+    if ((input_position + 8) >= (int)sizeof(password))
         return;
 
 #if 0
@@ -620,8 +641,38 @@ void handle_screen_resize(void) {
     xcb_configure_window(conn, win, mask, last_resolution);
     xcb_flush(conn);
 
-    xinerama_query_screens();
+    randr_query(screen->root);
     redraw_screen();
+}
+
+static bool verify_png_image(const char *image_path) {
+    if (!image_path) {
+        return false;
+    }
+
+    /* Check file exists and has correct PNG header */
+    FILE *png_file = fopen(image_path, "r");
+    if (png_file == NULL) {
+        fprintf(stderr, "Image file path \"%s\" cannot be opened: %s\n", image_path, strerror(errno));
+        return false;
+    }
+    unsigned char png_header[8];
+    memset(png_header, '\0', sizeof(png_header));
+    int bytes_read = fread(png_header, 1, sizeof(png_header), png_file);
+    fclose(png_file);
+    if (bytes_read != sizeof(png_header)) {
+        fprintf(stderr, "Could not read PNG header from \"%s\"\n", image_path);
+        return false;
+    }
+
+    // Check PNG header according to the specification, available at:
+    // https://www.w3.org/TR/2003/REC-PNG-20031110/#5PNG-file-signature
+    static unsigned char PNG_REFERENCE_HEADER[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (memcmp(PNG_REFERENCE_HEADER, png_header, sizeof(png_header)) != 0) {
+        fprintf(stderr, "File \"%s\" does not start with a PNG header. i3lock currently only supports loading PNG files.\n", image_path);
+        return false;
+    }
+    return true;
 }
 
 #ifndef __OpenBSD__
@@ -743,8 +794,14 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
                 break;
 
             default:
-                if (type == xkb_base_event)
+                if (type == xkb_base_event) {
                     process_xkb_event(event);
+                }
+                if (randr_base > -1 &&
+                    type == randr_base + XCB_RANDR_SCREEN_CHANGE_NOTIFY) {
+                    randr_query(screen->root);
+                    handle_screen_resize();
+                }
         }
 
         free(event);
@@ -762,8 +819,7 @@ static void raise_loop(xcb_window_t window) {
     xcb_generic_event_t *event;
     int screens;
 
-    if ((conn = xcb_connect(NULL, &screens)) == NULL ||
-        xcb_connection_has_error(conn))
+    if (xcb_connection_has_error((conn = xcb_connect(NULL, &screens))) > 0)
         errx(EXIT_FAILURE, "Cannot open display\n");
 
     /* We need to know about the window being obscured or getting destroyed. */
@@ -815,6 +871,11 @@ int main(int argc, char *argv[]) {
     int ret;
     struct pam_conv conv = {conv_callback, NULL};
 #endif
+#if defined(__linux__)
+    bool lock_tty_switching = false;
+    int term = -1;
+#endif
+
     int curs_choice = CURS_NONE;
     int o;
     int longoptind = 0;
@@ -833,6 +894,7 @@ int main(int argc, char *argv[]) {
         {"ignore-empty-password", no_argument, NULL, 'e'},
         {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'f'},
+        {"lock-console", no_argument, NULL, 'l'},
         {NULL, no_argument, NULL, 0}};
 
     if ((pw = getpwuid(getuid())) == NULL)
@@ -840,11 +902,11 @@ int main(int argc, char *argv[]) {
     if ((username = pw->pw_name) == NULL)
         errx(EXIT_FAILURE, "pw->pw_name is NULL.\n");
 
-    char *optstring = "hvnbdc:p:ui:teI:f";
+    char *optstring = "hvnbdc:p:ui:teI:fl";
     while ((o = getopt_long(argc, argv, optstring, longopts, &longoptind)) != -1) {
         switch (o) {
             case 'v':
-                errx(EXIT_SUCCESS, "version " VERSION " © 2010 Michael Stapelberg");
+                errx(EXIT_SUCCESS, "version " I3LOCK_VERSION " © 2010 Michael Stapelberg");
             case 'n':
                 dont_fork = true;
                 break;
@@ -898,9 +960,16 @@ int main(int argc, char *argv[]) {
             case 'f':
                 show_failed_attempts = true;
                 break;
+            case 'l':
+#if defined(__linux__)
+                lock_tty_switching = true;
+#else
+                errx(EXIT_FAILURE, "TTY switch locking is only supported on Linux.");
+#endif
+                break;
             default:
                 errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
-                                   " [-i image.png] [-t] [-e] [-I timeout] [-f]");
+                                   " [-i image.png] [-t] [-e] [-I timeout] [-f] [-l]");
         }
     }
 
@@ -987,10 +1056,12 @@ int main(int argc, char *argv[]) {
 
     load_compose_table(locale);
 
-    xinerama_init();
-    xinerama_query_screens();
-
     screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+
+    init_dpi();
+
+    randr_init(&randr_base, screen->root);
+    randr_query(screen->root);
 
     last_resolution[0] = screen->width_in_pixels;
     last_resolution[1] = screen->height_in_pixels;
@@ -998,7 +1069,7 @@ int main(int argc, char *argv[]) {
     xcb_change_window_attributes(conn, screen->root, XCB_CW_EVENT_MASK,
                                  (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY});
 
-    if (image_path) {
+    if (verify_png_image(image_path)) {
         /* Create a pixmap to render on, fill it with the background color */
         img = cairo_image_surface_create_from_png(image_path);
         /* In case loading failed, we just pretend no -i was specified. */
@@ -1007,8 +1078,8 @@ int main(int argc, char *argv[]) {
                     image_path, cairo_status_to_string(cairo_surface_status(img)));
             img = NULL;
         }
-        free(image_path);
     }
+    free(image_path);
 
     /* Pixmap on which the image is rendered to (if any) */
     xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
@@ -1064,6 +1135,21 @@ int main(int argc, char *argv[]) {
     if (main_loop == NULL)
         errx(EXIT_FAILURE, "Could not initialize libev. Bad LIBEV_FLAGS?\n");
 
+#if defined(__linux__)
+
+    /* Lock tty switching */
+    if (lock_tty_switching) {
+        if ((term = open("/dev/console", O_RDWR)) == -1) {
+            perror("error locking TTY switching: opening console failed");
+        }
+
+        if (term != -1 && (ioctl(term, VT_LOCKSWITCH)) == -1) {
+            perror("error locking TTY switching: locking console failed");
+        }
+    }
+
+#endif
+
     /* Explicitly call the screen redraw in case "locking…" message was displayed */
     auth_state = STATE_AUTH_IDLE;
     redraw_screen();
@@ -1090,6 +1176,18 @@ int main(int argc, char *argv[]) {
     if (stolen_focus == XCB_NONE) {
         return 0;
     }
+
+#if defined(__linux__)
+    /* Restore tty switching */
+    if (lock_tty_switching) {
+        if (term != -1 && (ioctl(term, VT_UNLOCKSWITCH)) == -1) {
+            perror("error unlocking TTY switching: unlocking console failed");
+        }
+
+        close(term);
+    }
+
+#endif
 
     DEBUG("restoring focus to X11 window 0x%08x\n", stolen_focus);
     xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
