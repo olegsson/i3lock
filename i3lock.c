@@ -40,11 +40,6 @@
 #endif
 #include <xcb/xcb_aux.h>
 #include <xcb/randr.h>
-#if defined(__linux__)
-#include <fcntl.h>
-#include <linux/vt.h>
-#include <sys/ioctl.h>
-#endif
 
 #include "i3lock.h"
 #include "xcb.h"
@@ -336,7 +331,7 @@ static void input_done(void) {
         else if (strcmp(mod_name, XKB_MOD_NAME_NUM) == 0)
             mod_name = "Num Lock";
         else if (strcmp(mod_name, XKB_MOD_NAME_LOGO) == 0)
-            mod_name = "Win";
+            mod_name = "Super";
 
         char *tmp;
         if (modifier_string == NULL) {
@@ -645,6 +640,152 @@ void handle_screen_resize(void) {
     redraw_screen();
 }
 
+static ssize_t read_raw_image_native(uint32_t *dest, FILE *src, size_t width, size_t height, int pixstride) {
+    ssize_t count = 0;
+    for (size_t y = 0; y < height; y++) {
+        size_t n = fread(&dest[y * pixstride], 1, width * 4, src);
+        count += n;
+        if (n < (size_t)(width * 4))
+            break;
+    }
+
+    return count;
+}
+
+struct raw_pixel_format {
+    int bpp;
+    int red;
+    int green;
+    int blue;
+};
+
+static ssize_t read_raw_image_fmt(uint32_t *dest, FILE *src, size_t width, size_t height, int pixstride,
+                                  struct raw_pixel_format fmt) {
+    unsigned char *buf = malloc(width * fmt.bpp);
+    if (buf == NULL)
+        return -1;
+
+    ssize_t count = 0;
+    for (size_t y = 0; y < height; y++) {
+        size_t n = fread(buf, 1, width * fmt.bpp, src);
+        count += n;
+        if (n < (size_t)(width * fmt.bpp))
+            break;
+
+        for (size_t x = 0; x < width; ++x) {
+            int idx = x * fmt.bpp;
+            dest[y * pixstride + x] = 0 |
+                                      (buf[idx + fmt.red]) << 16 |
+                                      (buf[idx + fmt.green]) << 8 |
+                                      (buf[idx + fmt.blue]);
+        }
+    }
+
+    free(buf);
+    return count;
+}
+
+// Pre-defind pixel formats (<bytes per pixel>, <red pixel>, <green pixel>, <blue pixel>)
+static const struct raw_pixel_format raw_fmt_rgb = {3, 0, 1, 2};
+static const struct raw_pixel_format raw_fmt_rgbx = {4, 0, 1, 2};
+static const struct raw_pixel_format raw_fmt_xrgb = {4, 1, 2, 3};
+static const struct raw_pixel_format raw_fmt_bgr = {3, 2, 1, 0};
+static const struct raw_pixel_format raw_fmt_bgrx = {4, 2, 1, 0};
+static const struct raw_pixel_format raw_fmt_xbgr = {4, 3, 2, 1};
+
+static cairo_surface_t *read_raw_image(const char *image_path, const char *image_raw_format) {
+    cairo_surface_t *img;
+
+#define RAW_PIXFMT_MAXLEN 6
+#define STRINGIFY1(x) #x
+#define STRINGIFY(x) STRINGIFY1(x)
+    /* Parse format as <width>x<height>:<pixfmt> */
+    char pixfmt[RAW_PIXFMT_MAXLEN + 1];
+    size_t w, h;
+    const char *fmt = "%zux%zu:%" STRINGIFY(RAW_PIXFMT_MAXLEN) "s";
+    if (sscanf(image_raw_format, fmt, &w, &h, pixfmt) != 3) {
+        fprintf(stderr, "Invalid image format: \"%s\"\n", image_raw_format);
+        return NULL;
+    }
+#undef RAW_PIXFMT_MAXLEN
+#undef STRINGIFY1
+#undef STRINGIFY
+
+    /* Create image surface */
+    img = cairo_image_surface_create(CAIRO_FORMAT_RGB24, w, h);
+    if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
+        fprintf(stderr, "Could not create surface: %s\n",
+                cairo_status_to_string(cairo_surface_status(img)));
+        return NULL;
+    }
+    cairo_surface_flush(img);
+
+    /* Use uint32_t* because cairo uses native endianness */
+    uint32_t *data = (uint32_t *)cairo_image_surface_get_data(img);
+    const int pixstride = cairo_image_surface_get_stride(img) / 4;
+
+    FILE *f = fopen(image_path, "r");
+    if (f == NULL) {
+        fprintf(stderr, "Could not open image \"%s\": %s\n",
+                image_path, strerror(errno));
+        cairo_surface_destroy(img);
+        return NULL;
+    }
+
+    /* Read the image, respecting cairo's stride, according to the pixfmt */
+    ssize_t size, count;
+    if (strcmp(pixfmt, "native") == 0) {
+        /* If the pixfmt is 'native', just read each line directly into the buffer */
+        size = w * h * 4;
+        count = read_raw_image_native(data, f, w, h, pixstride);
+    } else {
+        const struct raw_pixel_format *fmt = NULL;
+
+        if (strcmp(pixfmt, "rgb") == 0)
+            fmt = &raw_fmt_rgb;
+        else if (strcmp(pixfmt, "rgbx") == 0)
+            fmt = &raw_fmt_rgbx;
+        else if (strcmp(pixfmt, "xrgb") == 0)
+            fmt = &raw_fmt_xrgb;
+        else if (strcmp(pixfmt, "bgr") == 0)
+            fmt = &raw_fmt_bgr;
+        else if (strcmp(pixfmt, "bgrx") == 0)
+            fmt = &raw_fmt_bgrx;
+        else if (strcmp(pixfmt, "xbgr") == 0)
+            fmt = &raw_fmt_xbgr;
+
+        if (fmt == NULL) {
+            fprintf(stderr, "Unknown raw pixel format: %s\n", pixfmt);
+            fclose(f);
+            cairo_surface_destroy(img);
+            return NULL;
+        }
+
+        size = w * h * fmt->bpp;
+        count = read_raw_image_fmt(data, f, w, h, pixstride, *fmt);
+    }
+
+    cairo_surface_mark_dirty(img);
+
+    if (count < size) {
+        if (count < 0 || ferror(f)) {
+            fprintf(stderr, "Failed to read image \"%s\": %s\n",
+                    image_path, strerror(errno));
+            fclose(f);
+            cairo_surface_destroy(img);
+            return NULL;
+        } else {
+            /* Print a warning if the file contains less data than expected,
+             * but don't abort. It's useful to see how the image looks even if it's wrong. */
+            fprintf(stderr, "Warning: expected to read %zi bytes from \"%s\", read %zi\n",
+                    size, image_path, count);
+        }
+    }
+
+    fclose(f);
+    return img;
+}
+
 static bool verify_png_image(const char *image_path) {
     if (!image_path) {
         return false;
@@ -750,7 +891,7 @@ static void xcb_check_cb(EV_P_ ev_check *w, int revents) {
     xcb_generic_event_t *event;
 
     if (xcb_connection_has_error(conn))
-        errx(EXIT_FAILURE, "X11 connection broke, did your server terminate?\n");
+        errx(EXIT_FAILURE, "X11 connection broke, did your server terminate?");
 
     while ((event = xcb_poll_for_event(conn)) != NULL) {
         if (event->response_type == 0) {
@@ -820,7 +961,7 @@ static void raise_loop(xcb_window_t window) {
     int screens;
 
     if (xcb_connection_has_error((conn = xcb_connect(NULL, &screens))) > 0)
-        errx(EXIT_FAILURE, "Cannot open display\n");
+        errx(EXIT_FAILURE, "Cannot open display");
 
     /* We need to know about the window being obscured or getting destroyed. */
     xcb_change_window_attributes(conn, window, XCB_CW_EVENT_MASK,
@@ -867,15 +1008,11 @@ int main(int argc, char *argv[]) {
     struct passwd *pw;
     char *username;
     char *image_path = NULL;
+    char *image_raw_format = NULL;
 #ifndef __OpenBSD__
     int ret;
     struct pam_conv conv = {conv_callback, NULL};
 #endif
-#if defined(__linux__)
-    bool lock_tty_switching = false;
-    int term = -1;
-#endif
-
     int curs_choice = CURS_NONE;
     int o;
     int longoptind = 0;
@@ -890,19 +1027,19 @@ int main(int argc, char *argv[]) {
         {"help", no_argument, NULL, 'h'},
         {"no-unlock-indicator", no_argument, NULL, 'u'},
         {"image", required_argument, NULL, 'i'},
+        {"raw", required_argument, NULL, 0},
         {"tiling", no_argument, NULL, 't'},
         {"ignore-empty-password", no_argument, NULL, 'e'},
         {"inactivity-timeout", required_argument, NULL, 'I'},
         {"show-failed-attempts", no_argument, NULL, 'f'},
-        {"lock-console", no_argument, NULL, 'l'},
         {NULL, no_argument, NULL, 0}};
 
     if ((pw = getpwuid(getuid())) == NULL)
         err(EXIT_FAILURE, "getpwuid() failed");
     if ((username = pw->pw_name) == NULL)
-        errx(EXIT_FAILURE, "pw->pw_name is NULL.\n");
+        errx(EXIT_FAILURE, "pw->pw_name is NULL.");
 
-    char *optstring = "hvnbdc:p:ui:teI:fl";
+    char *optstring = "hvnbdc:p:ui:teI:f";
     while ((o = getopt_long(argc, argv, optstring, longopts, &longoptind)) != -1) {
         switch (o) {
             case 'v':
@@ -928,7 +1065,7 @@ int main(int argc, char *argv[]) {
                     arg++;
 
                 if (strlen(arg) != 6 || sscanf(arg, "%06[0-9a-fA-F]", color) != 1)
-                    errx(EXIT_FAILURE, "color is invalid, it must be given in 3-byte hexadecimal format: rrggbb\n");
+                    errx(EXIT_FAILURE, "color is invalid, it must be given in 3-byte hexadecimal format: rrggbb");
 
                 break;
             }
@@ -947,7 +1084,7 @@ int main(int argc, char *argv[]) {
                 } else if (!strcmp(optarg, "default")) {
                     curs_choice = CURS_DEFAULT;
                 } else {
-                    errx(EXIT_FAILURE, "i3lock: Invalid pointer type given. Expected one of \"win\" or \"default\".\n");
+                    errx(EXIT_FAILURE, "i3lock: Invalid pointer type given. Expected one of \"win\" or \"default\".");
                 }
                 break;
             case 'e':
@@ -956,20 +1093,15 @@ int main(int argc, char *argv[]) {
             case 0:
                 if (strcmp(longopts[longoptind].name, "debug") == 0)
                     debug_mode = true;
+                else if (strcmp(longopts[longoptind].name, "raw") == 0)
+                    image_raw_format = strdup(optarg);
                 break;
             case 'f':
                 show_failed_attempts = true;
                 break;
-            case 'l':
-#if defined(__linux__)
-                lock_tty_switching = true;
-#else
-                errx(EXIT_FAILURE, "TTY switch locking is only supported on Linux.");
-#endif
-                break;
             default:
                 errx(EXIT_FAILURE, "Syntax: i3lock [-v] [-n] [-b] [-d] [-c color] [-u] [-p win|default]"
-                                   " [-i image.png] [-t] [-e] [-I timeout] [-f] [-l]");
+                                   " [-i image.png] [-t] [-e] [-I timeout] [-f]");
         }
     }
 
@@ -1069,7 +1201,11 @@ int main(int argc, char *argv[]) {
     xcb_change_window_attributes(conn, screen->root, XCB_CW_EVENT_MASK,
                                  (uint32_t[]){XCB_EVENT_MASK_STRUCTURE_NOTIFY});
 
-    if (verify_png_image(image_path)) {
+    if (image_raw_format != NULL && image_path != NULL) {
+        /* Read image. 'read_raw_image' returns NULL on error,
+         * so we don't have to handle errors here. */
+        img = read_raw_image(image_path, image_raw_format);
+    } else if (verify_png_image(image_path)) {
         /* Create a pixmap to render on, fill it with the background color */
         img = cairo_image_surface_create_from_png(image_path);
         /* In case loading failed, we just pretend no -i was specified. */
@@ -1079,7 +1215,9 @@ int main(int argc, char *argv[]) {
             img = NULL;
         }
     }
+
     free(image_path);
+    free(image_raw_format);
 
     /* Pixmap on which the image is rendered to (if any) */
     xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
@@ -1133,22 +1271,7 @@ int main(int argc, char *argv[]) {
     /* Initialize the libev event loop. */
     main_loop = EV_DEFAULT;
     if (main_loop == NULL)
-        errx(EXIT_FAILURE, "Could not initialize libev. Bad LIBEV_FLAGS?\n");
-
-#if defined(__linux__)
-
-    /* Lock tty switching */
-    if (lock_tty_switching) {
-        if ((term = open("/dev/console", O_RDWR)) == -1) {
-            perror("error locking TTY switching: opening console failed");
-        }
-
-        if (term != -1 && (ioctl(term, VT_LOCKSWITCH)) == -1) {
-            perror("error locking TTY switching: locking console failed");
-        }
-    }
-
-#endif
+        errx(EXIT_FAILURE, "Could not initialize libev. Bad LIBEV_FLAGS?");
 
     /* Explicitly call the screen redraw in case "locking…" message was displayed */
     auth_state = STATE_AUTH_IDLE;
@@ -1176,18 +1299,6 @@ int main(int argc, char *argv[]) {
     if (stolen_focus == XCB_NONE) {
         return 0;
     }
-
-#if defined(__linux__)
-    /* Restore tty switching */
-    if (lock_tty_switching) {
-        if (term != -1 && (ioctl(term, VT_UNLOCKSWITCH)) == -1) {
-            perror("error unlocking TTY switching: unlocking console failed");
-        }
-
-        close(term);
-    }
-
-#endif
 
     DEBUG("restoring focus to X11 window 0x%08x\n", stolen_focus);
     xcb_ungrab_pointer(conn, XCB_CURRENT_TIME);
