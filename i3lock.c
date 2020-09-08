@@ -27,7 +27,6 @@
 #include <security/pam_appl.h>
 #endif
 #include <getopt.h>
-#include <string.h>
 #include <ev.h>
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon.h>
@@ -35,7 +34,7 @@
 #include <xkbcommon/xkbcommon-x11.h>
 #include <cairo.h>
 #include <cairo/cairo-xcb.h>
-#ifdef __OpenBSD__
+#ifdef HAVE_EXPLICIT_BZERO
 #include <strings.h> /* explicit_bzero(3) */
 #endif
 #include <xcb/xcb_aux.h>
@@ -64,6 +63,7 @@ xcb_window_t win;
 static xcb_cursor_t cursor;
 #ifndef __OpenBSD__
 static pam_handle_t *pam_handle;
+static bool pam_cleanup;
 #endif
 int input_position = 0;
 /* Holds the password you enter (in UTF-8). */
@@ -104,7 +104,7 @@ bool skip_repeated_empty_password = false;
  * Decrements i to point to the previous unicode glyph
  *
  */
-void u8_dec(char *s, int *i) {
+static void u8_dec(char *s, int *i) {
     (void)(isutf(s[--(*i)]) || isutf(s[--(*i)]) || isutf(s[--(*i)]) || --(*i));
 }
 
@@ -174,7 +174,7 @@ static bool load_compose_table(const char *locale) {
  *
  */
 static void clear_password_memory(void) {
-#ifdef __OpenBSD__
+#ifdef HAVE_EXPLICIT_BZERO
     /* Use explicit_bzero(3) which was explicitly designed not to be
      * optimized out by the compiler. */
     explicit_bzero(password, strlen(password));
@@ -298,7 +298,7 @@ static void input_done(void) {
          * credentials like kerberos /tmp/krb5cc_pam_* files which may of been left behind if the
          * refresh of the credentials failed. */
         pam_setcred(pam_handle, PAM_REFRESH_CRED);
-        pam_end(pam_handle, PAM_SUCCESS);
+        pam_cleanup = true;
 
         ev_break(EV_DEFAULT, EVBREAK_ALL);
         return;
@@ -612,7 +612,7 @@ static void process_xkb_event(xcb_generic_event_t *gevent) {
  * and also redraw the image, if any.
  *
  */
-void handle_screen_resize(void) {
+static void handle_screen_resize(void) {
     xcb_get_geometry_cookie_t geomc;
     xcb_get_geometry_reply_t *geom;
     geomc = xcb_get_geometry(conn, screen->root);
@@ -1220,7 +1220,8 @@ int main(int argc, char *argv[]) {
     free(image_raw_format);
 
     /* Pixmap on which the image is rendered to (if any) */
-    xcb_pixmap_t bg_pixmap = draw_image(last_resolution);
+    xcb_pixmap_t bg_pixmap = create_bg_pixmap(conn, screen, last_resolution, color);
+    draw_image(bg_pixmap, last_resolution);
 
     xcb_window_t stolen_focus = find_focused_window(conn, screen->root);
 
@@ -1295,6 +1296,12 @@ int main(int argc, char *argv[]) {
      * file descriptor becomes readable). */
     ev_invoke(main_loop, xcb_check, 0);
     ev_loop(main_loop, 0);
+
+#ifndef __OpenBSD__
+    if (pam_cleanup) {
+        pam_end(pam_handle, PAM_SUCCESS);
+    }
+#endif
 
     if (stolen_focus == XCB_NONE) {
         return 0;
